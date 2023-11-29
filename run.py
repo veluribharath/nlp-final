@@ -31,13 +31,6 @@ def log_training_dynamics(output_dir: os.path,
     os.makedirs(logging_dir)
   epoch_file_name = os.path.join(logging_dir, f"dynamics_epoch_{epoch}.jsonl")
   td_df.to_json(epoch_file_name, lines=True, orient="records")
-
-class CustomTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-    
-    def predict(self, test_dataset: Dataset, ignore_keys: List[str] | None = None, metric_key_prefix: str = "test") -> PredictionOutput:
-        return super().predict(test_dataset, ignore_keys, metric_key_prefix)
     
 class SaveEvalMetricsCallback(TrainerCallback):
     def __init__(self, trainer):
@@ -46,18 +39,11 @@ class SaveEvalMetricsCallback(TrainerCallback):
     
     def on_epoch_end(self, args, state, control, **kwargs):
         # evaluate on the validation dataset
-        train_results = self.trainer.evaluate(eval_dataset=self.trainer.train_dataset, metric_key_prefix="eval")
-        train_predictions = self.trainer.predict(test_dataset=self.trainer.train_dataset, metric_key_prefix="eval")
-        # save the evaluation metrics
-        self.trainer.log_metrics("train", train_results)
-        self.trainer.save_metrics("train", train_results)
-        print(train_results)
-        print(train_predictions)
-        log_training_dynamics(self.trainer.args.output_dir, state.epoch, [1]*self.trainer.train_dataset.__len__() , train_predictions['predictions'] , train_predictions['label_ids'])
+        train_predictions = self.trainer.predict(test_dataset=self.trainer.train_dataset, metric_key_prefix="train")
+        log_training_dynamics(self.trainer.args.output_dir, int(state.epoch)-1, self.trainer.train_dataset['id'] , list(train_predictions.predictions) , train_predictions.label_ids)
         # return the original control object
         return control
     
-
 def main():
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
@@ -95,10 +81,12 @@ def main():
                       help='Limit the number of examples to train on.')
     argp.add_argument('--max_eval_samples', type=int, default=None,
                       help='Limit the number of examples to evaluate on.')
+    argp.add_argument('--save_training_dynamics', action='store_true', default=False,
+                      help='Save training dynamics (logits) for each epoch')
     
     # argp.add_argument('--evaluation_strategy', default='epoch', type=str)
     # argp.add_argument('--logging_strategy', default='epoch', type=str)
-    # argp.add_argument('--save_strategy', default='epoch', type=str)
+    argp.add_argument('--save_strategy', default='epoch', type=str)
 
     training_args, args = argp.parse_args_into_dataclasses()
 
@@ -126,7 +114,7 @@ def main():
             dataset = datasets.load_dataset(*dataset_id, 'distractor')
         else:
             dataset = datasets.load_dataset(*dataset_id)
-    
+
     # NLI models need to have the output label count specified (label 0 is "entailed", 1 is "neutral", and 2 is "contradiction")
     task_kwargs = {'num_labels': 3} if args.task == 'nli' or args.task == 'mnli' else {}
 
@@ -139,8 +127,6 @@ def main():
     model_class = model_classes[args.task]
     # Initialize the model and tokenizer from the specified pretrained model/checkpoint
     model = model_class.from_pretrained(args.model, **task_kwargs)
-    # print(model)
-    # exit()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
     # Select the dataset preprocessing function (these functions are defined in helpers.py)
@@ -158,7 +144,10 @@ def main():
     if dataset_id == ('snli',):
         # remove SNLI examples with no label
         dataset = dataset.filter(lambda ex: ex['label'] != -1)
-    
+    if args.save_training_dynamics:
+        for dataset_group in dataset.keys():
+            dataset[dataset_group] = dataset[dataset_group].add_column(name="id", column=[i for i in range(len(dataset[dataset_group]))])
+
     train_dataset = None
     eval_dataset = None
     train_dataset_featurized = None
@@ -167,21 +156,31 @@ def main():
         train_dataset = dataset['train']
         if args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
+        print(train_dataset.column_names)
+        print(type(train_dataset.column_names))
+        if "id" in train_dataset.column_names:
+            train_remove_columns = train_dataset.column_names.remove("id")
+        else:
+            train_remove_columns = train_dataset.column_names
         train_dataset_featurized = train_dataset.map(
             prepare_train_dataset,
             batched=True,
             num_proc=NUM_PREPROCESSING_WORKERS,
-            remove_columns=train_dataset.column_names
+            remove_columns=train_remove_columns
         )
     if training_args.do_eval:
         eval_dataset = dataset[eval_split]
         if args.max_eval_samples:
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+        if "id" in eval_dataset.column_names:
+            eval_remove_columns = eval_dataset.column_names.remove("id")    
+        else:
+            eval_remove_columns = eval_dataset.column_names    
         eval_dataset_featurized = eval_dataset.map(
             prepare_eval_dataset,
             batched=True,
             num_proc=NUM_PREPROCESSING_WORKERS,
-            remove_columns=eval_dataset.column_names
+            remove_columns=eval_remove_columns
         )
 
     # Select the training configuration
@@ -219,8 +218,11 @@ def main():
         tokenizer=tokenizer,
         compute_metrics=compute_metrics_and_store_predictions
     )
-    saveEvalMetricscallback = SaveEvalMetricsCallback(trainer=trainer)
-    trainer.add_callback(saveEvalMetricscallback)
+    
+    if args.save_training_dynamics:
+        saveEvalMetricscallback = SaveEvalMetricsCallback(trainer=trainer)
+        trainer.add_callback(saveEvalMetricscallback)
+    
     # Train and/or evaluate
     if training_args.do_train:
         print("Training...")

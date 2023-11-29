@@ -5,3 +5,4 @@ eval_output*/
 .ipynb_checkpoints/
 vocab.pkl
 .DS_Store
+*.zip
