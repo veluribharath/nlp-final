@@ -10,27 +10,49 @@ from helpers import prepare_dataset_nli, prepare_train_dataset_qa, \
 import os
 import json
 import pandas as pd
+import numpy as np
+import torch
 
 NUM_PREPROCESSING_WORKERS = 2
+
+#  customize the way the loss is computed based on the logits
+#  https://huggingface.co/transformers/_modules/transformers/trainer.html#Trainer.compute_loss
+class CustomTrainer(Trainer):
+    def __init__(self, model, args, data_collator, train_dataset=None, eval_dataset=None, tokenizer=None, compute_metrics=None, callbacks=None, optimizers=None, **kwargs):
+        super().__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, compute_metrics, callbacks, optimizers, **kwargs)
+        self.loss_fct = torch.nn.CrossEntropyLoss()
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs[0]
+        loss = self.loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+def sample_dataset(dataset, sample_ids):
+    df = dataset.to_pandas()
+    df.set_index('id', inplace=True)
+    df = df.loc[sample_ids]
+    return datasets.Dataset.from_pandas(df)
 
 def log_training_dynamics(output_dir: os.path,
                           epoch: int,
                           train_ids: List[int],
                           train_logits: List[List[float]],
                           train_golds: List[int]):
-  """
-  Save training dynamics (logits) from given epoch as records of a `.jsonl` file.
-  """
-  td_df = pd.DataFrame({"guid": train_ids,
+    """
+    Save training dynamics (logits) from given epoch as records of a `.jsonl` file.
+    """
+    td_df = pd.DataFrame({"guid": train_ids,
                         f"logits_epoch_{epoch}": train_logits,
                         "gold": train_golds})
 
-  logging_dir = os.path.join(output_dir, f"training_dynamics")
-  # Create directory for logging training dynamics, if it doesn't already exist.
-  if not os.path.exists(logging_dir):
-    os.makedirs(logging_dir)
-  epoch_file_name = os.path.join(logging_dir, f"dynamics_epoch_{epoch}.jsonl")
-  td_df.to_json(epoch_file_name, lines=True, orient="records")
+    logging_dir = os.path.join(output_dir, f"training_dynamics")
+    # Create directory for logging training dynamics, if it doesn't already exist.
+    if not os.path.exists(logging_dir):
+        os.makedirs(logging_dir)
+    epoch_file_name = os.path.join(logging_dir, f"dynamics_epoch_{epoch}.jsonl")
+    td_df.to_json(epoch_file_name, lines=True, orient="records")
     
 class SaveEvalMetricsCallback(TrainerCallback):
     def __init__(self, trainer):
@@ -83,10 +105,8 @@ def main():
                       help='Limit the number of examples to evaluate on.')
     argp.add_argument('--save_training_dynamics', action='store_true', default=False,
                       help='Save training dynamics (logits) for each epoch')
-    
-    # argp.add_argument('--evaluation_strategy', default='epoch', type=str)
-    # argp.add_argument('--logging_strategy', default='epoch', type=str)
-    argp.add_argument('--save_strategy', default='epoch', type=str)
+    argp.add_argument('--data_sampling_path', default=None, type=str
+                      , help='Use data sampling for training')
 
     training_args, args = argp.parse_args_into_dataclasses()
 
@@ -103,17 +123,39 @@ def main():
         # so if we want to use a jsonl file for evaluation we need to get the "train" split
         # from the loaded dataset
         eval_split = 'train'
+    elif args.dataset.endswith('.tsv'):
+        dataset_id = None
+        folder = "/".join(args.dataset.split('/')[:-1])
+        eval_split = 'validation_matched' if args.task == 'mnli' else 'validation'
+        # Load from local tsv file
+        dataset_files = {'train': args.dataset, eval_split: folder + f'/{eval_split}.tsv', 'test': folder + '/test.tsv'}
+        dataset = datasets.load_dataset('csv', data_files=dataset_files, delimiter='\t')
+        dataset = dataset.filter(lambda ex: isinstance(ex['hypothesis'], (str,list)))
+        print("loaded custom dataset with schema:", dataset)
     else:
         default_datasets = {'qa': ('squad',), 'nli': ('snli',), 'hqa': ('hotpot_qa',), 'mnli': ('glue','mnli')}
         dataset_id = tuple(args.dataset.split(':')) if args.dataset is not None else \
             default_datasets[args.task]
         # MNLI has two validation splits (one with matched domains and one with mismatched domains). Most datasets just have one "validation" split
-        eval_split = 'validation_matched' if dataset_id == ('glue','mnli') else 'validation'
+        eval_split = 'validation_matched' if args.task == 'mnli' else 'validation'
         # Load the raw data
         if dataset_id == ('hotpot_qa',):
             dataset = datasets.load_dataset(*dataset_id, 'distractor')
         else:
             dataset = datasets.load_dataset(*dataset_id)
+
+    # If you want to use data sampling for training, you should define your own "prepare_train_dataset" function.
+    if args.data_sampling_path is not None:
+        #read data sampling file
+        sample_ids = np.load(args.data_sampling_path)
+        # if len(sample_ids) == len(set(sample_ids)):
+        #     dataset['train'] = dataset['train'].filter(lambda ex: ex['id'] in sample_ids)
+        # else:
+        #     dataset['train'] = sample_dataset(dataset['train'], sample_ids)
+        dataset['train'] = sample_dataset(dataset['train'], sample_ids) # this approach faster
+
+    # breakpoint()
+    # exit()
 
     # NLI models need to have the output label count specified (label 0 is "entailed", 1 is "neutral", and 2 is "contradiction")
     task_kwargs = {'num_labels': 3} if args.task == 'nli' or args.task == 'mnli' else {}
@@ -146,7 +188,11 @@ def main():
         dataset = dataset.filter(lambda ex: ex['label'] != -1)
     if args.save_training_dynamics:
         for dataset_group in dataset.keys():
-            dataset[dataset_group] = dataset[dataset_group].add_column(name="id", column=[i for i in range(len(dataset[dataset_group]))])
+            if "id" not in dataset[dataset_group].column_names:
+                dataset[dataset_group] = dataset[dataset_group].add_column(name="id", column=[i for i in range(len(dataset[dataset_group]))])
+    
+    # for split, dataset in dataset.items():
+    #     dataset.to_csv(f"velurib-snli/{split}.tsv", index=None, sep="\t")
 
     train_dataset = None
     eval_dataset = None
@@ -156,8 +202,6 @@ def main():
         train_dataset = dataset['train']
         if args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
-        print(train_dataset.column_names)
-        print(type(train_dataset.column_names))
         if "id" in train_dataset.column_names:
             train_remove_columns = train_dataset.column_names.remove("id")
         else:

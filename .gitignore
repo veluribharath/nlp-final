@@ -6,3 +6,5 @@ eval_output*/
 vocab.pkl
 .DS_Store
 *.zip
+artifact*/
+velurib-*/
